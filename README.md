@@ -1,5 +1,7 @@
 # STEM Studio
 
+BS RoFormerを使い、音源をドラッグ＆ドロップしてSTEM分離するMac向けデスクトップアプリです。
+
 ## 解析アルゴリズムと使用モデル
 
 ### 使用モデル一覧
@@ -27,7 +29,6 @@ candidateと小節内の既出candidate集合を状態に持つbeam型Viterbiで
 
 コード解析の調整値は `analysis/chord_estimator.py` 冒頭の `PARAMS` に集約しています。
 
-BS RoFormerを使い、音源をドラッグ＆ドロップしてSTEM分離するMac向けデスクトップアプリです。
 
 ## 起動
 
@@ -123,3 +124,15 @@ PyTorch / torchaudioは、Demucsの音声保存APIとの互換性のため2.5.1�
 ダイアグラムのフォームは `chord_shape.json` に集約しています（`frets` は6弦→1弦、`-1` はミュート、`barre` は `[フレット, 開始弦index, 終了弦index]`、弦indexは0〜5）。旧 `chord_shapes.json` の手修正も移行済みです。コード表の編集・保存もこのファイルを使用します。フォームの自動生成・移調による補完は行わず、未登録のコードは「フォーム未登録」と表示します。バレーもJSONに指定したものを使います。
 
 アコギのコード境界は、短い区間の補完後に拍位置（4分音符）へ揃えます。8分音符以下の細かい境界は表示しません。1小節単位に固定せず、テンポ変化に追従します。拍がなければBPM（未取得時は暫定120）を使用します。音源の先頭・末尾はそのまま保ち、同じ時刻に揃った境界から長さ0の区間ができた場合は除去します。保存済みの結果にも再推論なしで適用します。アコギビューのコードカードをクリックすると、エレキ＋アコギビューと同じ修正・挿入ダイアログを開けます。編集結果は `acoustic-guitar-chords.json` と `_raw_chords` に保存し、次回のグリッド更新でも保持します。
+
+### 謝辞・外部モデル
+
+本アプリは以下のオープンソース実装および学習済みモデルを利用しています。各ソフトウェア、モデル重み、データセットのライセンスと利用条件は、それぞれの配布元の表記に従ってください。
+
+- [BS RoFormer Infer](https://github.com/openmirlab/bs-roformer-infer) — 6 stem分離の実装。使用する **BS RoFormer SW** 重みの配布条件にも従います。
+- [BS-RoFormer-MVSep-Mega-53-stems](https://huggingface.co/noblebarkrr/BS-Roformer-MVSep-Mega-53-stems) — Mega53 Acoustic Guitarのチェックポイントと設定。
+- [Beat This!](https://github.com/CPJKU/beat_this) — BPM、beat、downbeat推定。
+- [Spotify Basic Pitch](https://github.com/spotify/basic-pitch) — ボーカルおよびベースの音高・ノート推定。
+- [Transkun](https://github.com/linjialuo/Transkun) — ピアノMIDI推定。
+- [ADTOF-pytorch](https://github.com/xavriley/ADTOF-pytorch) — ドラムのイベント推定。
+- [Solitito](https://github.com/greblus/solitito) と [Solitito AIモデル](https://huggingface.co/greblus/solitito-ai) — アコギコード推定。Solitito由来のDSP実装とライセンスは [vendor/solitito/LICENSE](vendor/solitito/LICENSE) に同梱しています。

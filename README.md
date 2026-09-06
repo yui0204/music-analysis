@@ -2,6 +2,21 @@
 
 ## 解析アルゴリズムと使用モデル
 
+### 使用モデル一覧
+
+| 処理 | 使用モデル / 手法 | 出力と役割 |
+| --- | --- | --- |
+| 音源分離 | **BS RoFormer SW** | ボーカル、ドラム、ベース、ギター、ピアノ、その他の6 stemを分離します。 |
+| アコギ分離 | **BS RoFormer Mega53 Acoustic Guitar** | SWのギター出力を入力に、アコギと残りのギター音を分離します。標準のカスケード経路です。 |
+| BPM・拍・小節頭 | **Beat This!** (`final0`) | BPM、四分音符の `beats`、4/4の小節頭 `downbeats` を `beat-grid.json` に保存します。 |
+| ボーカルMIDI | **Spotify Basic Pitch**（ICASSP 2022） | 音域をC3–C6へ絞り、単旋律化したノート列を保存します。 |
+| ベースMIDI | **Spotify Basic Pitch**（ICASSP 2022） | E1–G4に絞り、優勢な最低音を単旋律化してルート推定に使います。 |
+| ピアノMIDI | **Transkun V2** | ピアノロールとコード品質・テンション判定に使うノート列を生成します。 |
+| ドラムMIDI | **ADTOF-pytorch** | kick / snare / tom / hi-hat / cymbal のonsetを生成します。利用できない環境ではスペクトルonset検出へフォールバックします。 |
+| アコギコード | **Solitito v2** ONNX + DSP重み | アコギ音源から基本コード品質を推定します。出力品質は major, minor, maj7, 7, m7, m7♭5, dim7, aug, sus に限られます。 |
+
+すべてローカルで推論します。各モデルの重みは初回のみダウンロードされ、分離モデルは `.cache/bs_roformer/`、Solititoは `.cache/solitito/` に保存されます。
+
 デフォルトの分離経路は `BS RoFormer SW → Mega53 Acoustic Guitar` のカスケードです。SWでボーカル、ドラム、ベース、エレキギター、ピアノ、その他を分離し、その出力からMega53でアコギとギター残りを分離します。必要なWAVがすべて揃っていれば再処理せず、不足パートだけを処理します。BS RoFormerはApple SiliconではMLXを優先し、Torch/MPS、CPUの順にフォールバックします。
 
 BPMと拍グリッドはBeat This!で推定し、`beat-grid.json`に保存します。`downbeats`が4/4の位相、`beats`が四分音符格子です。ドラムはADTOF-pytorch、ピアノはTranskun V2、ベースはBasic Pitch系の専用処理を使います。ベースの8分音符未満の装飾音はコード解析から除外し、ピアノは持続音と同時発音和音を中心に使います。

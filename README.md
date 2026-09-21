@@ -15,7 +15,8 @@ BS RoFormerを使い、音源をドラッグ＆ドロップしてSTEM分離す�
 | ベースMIDI | **Spotify Basic Pitch**（ICASSP 2022） | E1–G4に絞り、優勢な最低音を単旋律化してルート推定に使います。 |
 | ピアノMIDI | **Transkun V2** | ピアノロールとコード品質・テンション判定に使うノート列を生成します。 |
 | ドラムMIDI | **ADTOF-pytorch** | kick / snare / tom / hi-hat / cymbal のonsetを生成します。利用できない環境ではスペクトルonset検出へフォールバックします。 |
-| アコギコード | **Solitito v2** ONNX + DSP重み | アコギ音源から基本コード品質を推定します。出力品質は major, minor, maj7, 7, m7, m7♭5, dim7, aug, sus に限られます。 |
+| アコギコード | **BTC large-vocabulary + MIDI補助** | アコギ単独音源を入力に推定します。統合欄と同じ168コード語彙を使います。 |
+| 統合コード | **BTC large-vocabulary + MIDI補助** | 音声を主根拠に168コード＋不明・無和音を推定。持続ベースから転回形を付けます。 |
 
 すべてローカルで推論します。各モデルの重みは初回のみダウンロードされ、分離モデルは `.cache/bs_roformer/`、Solititoは `.cache/solitito/` に保存されます。
 
@@ -23,11 +24,11 @@ BS RoFormerを使い、音源をドラッグ＆ドロップしてSTEM分離す�
 
 BPMと拍グリッドはBeat This!で推定し、`beat-grid.json`に保存します。`downbeats`が4/4の位相、`beats`が四分音符格子です。ドラムはADTOF-pytorch、ピアノはTranskun V2、ベースはBasic Pitch系の専用処理を使います。ベースの8分音符未満の装飾音はコード解析から除外し、ピアノは持続音と同時発音和音を中心に使います。
 
-コード解析v8はアコギのSolitito推定を軸にしますが、タイミングはdownbeat、Beat This!のbeats、ドラムonsetで先に固定します。各四分音符セルで、Piano chromaをコード品質、Bassをroot/転回形として別々に採点します。境界scoreはBass変化`0.50`、Piano変化`0.35`、拍節`0.15`で、Drumは境界判定には使いません。
+通常のコード解析はBTC large-vocabularyを主推定器に使います。`mix.wav` / `original.wav` があれば使用し、なければSWの6 stemを加算して入力します。`guitar.wav` とそのアコギ分割音源は二重加算しません。音源がないJSONのみのフォルダは従来のMIDI推定を利用します。
 
-candidateと小節内の既出candidate集合を状態に持つbeam型Viterbiで系列を推定します。3種類目の追加に`-0.15`、4種類目以降に`-0.35`を新規追加時だけ適用し、2・4拍目の変更には`-0.50`のpriorを置きます。MIDI marginが`0.10`未満の曖昧セルだけ、Solitito confidenceに比例したbonusを現在セルと前後セルへ加えて2回目のViterbiを実行します。グリッドは動かさず、最後に同一candidateの連続区間だけを結合します。
+公式の約12MBの重みを `.cache/btc/` に保存し、リビジョンとSHA-256を固定して検証します。CPU・float32・最大4スレッドで、音源読み込みと推論は10秒単位です。BTCの対数確率に弱いピアノ・ベース・保存済みSolititoの証拠を加え、線形計算量のViterbiで整えます。四分音符への固定や小節内のコード種類数制限はなく、約93ms単位で変化を扱います。分数コードは各コード区間全体で優勢な持続ベースがある場合に付加します。
 
-コード解析の調整値は `analysis/chord_estimator.py` 冒頭の `PARAMS` に集約しています。
+BTCの14品質は major / minor / dim / aug / m6 / 6 / m7 / mMaj7 / maj7 / 7 / dim7 / m7b5 / sus2 / sus4 です。add9・9・11・13はモデルの直接出力には含まれません。`X`は判定不能、`N.C.`は無和音です。実装は `analysis/btc_chords.py`、公式出典とライセンスは `vendor/btc/` にあります。正解譜との精度比較は未実施です。
 
 
 ## 起動
@@ -53,21 +54,21 @@ MIDIビュー内の **BPM/拍グリッドを推定** ボタンからBeat This!�
 
 再生速度は `0.5x / 0.75x / 1.0x / 1.25x / 1.5x` から選べます。
 
-統合コード解析v8は、downbeatを4/4の絶対的な1拍目として位相を固定し、Beat This!のbeats/BPMから4分音符latticeを作ります。各拍±0.15拍のDrum MIDIを探し、kick/cymbalは強く、snare/tomは中程度、hi-hatは弱く一度だけ吸着して固定します。固定セルごとにPianoだけでコード品質、Bassだけでroot/inversionを採点し、境界スコア（Bass変化35%、Piano chroma変化30%、Drum onset 20%、拍節15%）を使ってMIDI-only Viterbiを実行します。MIDI marginが小さいセルだけ、Solitito confidenceに比例したbonusを現在位置1.0、前後1拍0.5で上位3候補へ加え、2回目のViterbiで系列を整えます。Bass MIDIの同音結合は行いません。最終処理は同一コードの結合だけです。
+**コード解析**ボタンで、アコギ欄と統合欄の両方をBTCで再推定します。アコギ欄は `acoustic-guitar.wav`、統合欄は全体ミックスを入力にします。MIDI・拍グリッドは保存済み結果を補助に使います。アコギ結果も `acoustic-guitar-chords.json` に上書きします。BTCの結果にはSolitito用の四分音符補完を適用しません。以前のBTC結果を再推定の根拠に循環利用することもありません。
 
 既存の `chords.json`（手修正を含む）は自動更新しません。コードだけを新版で再推定する場合は、必要に応じて保存結果をバックアップし、対象フォルダを指定して以下を実行します。この操作はそのフォルダのコードの手修正も置き換えます。MIDIや拍グリッドは再推論しません。
 
 ```sh
-.venv/bin/python -c 'from chord_estimator import load_or_estimate; load_or_estimate("outputs/曲名", force=True)'
+.venv/bin/python -c 'from analysis.chord_estimator import load_or_estimate; load_or_estimate("outputs/曲名", force=True)'
 ```
 
-コード推定の回帰テスト: `.venv/bin/python -m unittest test_chord_estimator -v`。
+コード推定の回帰テスト: `.venv/bin/python -m unittest discover -s tests -p 'test_*chord*.py' -v`。
 
 `acoustic-guitar.wav` がある場合は、アコギ欄にもエレキ＋アコギのコードビューと同じ、コード名とダイアグラムが左へ流れるタイムラインを表示します。アコギ欄の **再コード解析** は、保存済み結果を使わず、[Solitito](https://github.com/greblus/solitito)の公式ONNXモデルで毎回アコギ音源を再解析します。解析後は統合コードも更新します。現在のコードと続く10秒のコードを再生位置に合わせて表示します。両方のコードビューには拍グリッドの小節頭（downbeats）を縦の破線で表示し、コードと同じ速度でスクロールします。小節頭が未推定の場合は小節線を表示しません。結果は参考用の `acoustic-guitar-chords.json` に保存され、フォルダを開き直した際に読み込まれます。従来のMIDI由来コードとは別に保持します。
 
 初回のみ[公式モデルとDSP重み](https://huggingface.co/greblus/solitito-ai)（合計約32MB）を `.cache/solitito/` に取得し、以降はCPUでローカル推論します。音源のアップロードはありません。単音・無音判定は `N.C.`、モデルが区別しないsus2/sus4は `sus` と表示し、ダイアグラムの代わりに「sus2 / sus4 未判定」と表示します。分離時の混入や速いコード変化に影響されるため、正解譜ではなく比較用の推定結果です。モデルの文脈窓の中心に時刻を合わせ、短い判定の揺れを抑えています。
 
-ターミナルからも `.venv/bin/python acoustic_chords.py "outputs/曲名"` で実行できます。**BPM/MIDI/アコギ解析**ボタンは、拍グリッド、各MIDI、アコギのSolitito推定を順番に実行し、保存済みファイルがあればスキップします。**コード解析**ボタンは、アコギを基準にした統合コード推定だけを毎回実行します。統合コードはアコギの境界とコード名を保持したまま、ピアノ・ベースの構成音とベース音、ドラムの発音位置で確度の低い箇所だけ補正し、エレキ＋アコギビューへ表示します。アコギ解析の `--force` はアコギだけを再推定したい場合に使えます。統合テスト: `.venv/bin/python -m unittest test_acoustic_chords -v`（モデル取得済みなら実モデルによる推論も検証）。
+アコギ単独のBTC再解析は `.venv/bin/python -m analysis.btc_chords "outputs/曲名" --force` で実行できます。保存済みの旧Solitito結果は再解析するまで残り、画面に「Solitito（旧結果）」と表示します。以下のSolititoの補完仕様は旧結果にのみ適用します。
 
 アコギのコードは4分音符（1拍）未満の区間を、前後のコードで補完します。拍グリッドのテンポ変化を反映し、拍がなければBPM、BPMもなければ暫定120 BPM（0.5秒）を使います。ちょうど4分音符のコードと `N.C.` は残します。前後が同じコードならつなぎ、異なる場合は元の区間の長さと推定信頼度を比べて、支持の強い側を延長します。同点は直前のコードを優先します。先頭・末尾は隣接するコードで補完します。無音判定や元からある空白はまたがず、候補がない区間は `N.C.` とします。補完した時間は信頼度を加点せず、統合区間の信頼度を時間加重で計算します。保存済みの結果にも読み込み時に適用され、再推論は不要です。元の区間を保持するため、後で拍グリッドを更新した場合も元データから判定し直します。
 
@@ -84,7 +85,7 @@ MIDIビュー内の **BPM/拍グリッドを推定** ボタンからBeat This!�
 
 平均合成は行いません。
 BS RoFormer SWは6パートを1回の推論で保存します。
-アコギ抽出は必ずカスケード経路で実行します。まずSWで `vocals.wav`、`drums.wav`、`bass.wav`、`guitar.wav`、`piano.wav`、`other.wav` を保存し、そのうえでMega53 Acoustic Guitarを使って `acoustic-guitar.wav` と `guitar-other.wav` も保存します。Solititoのフレーム出力は最初から4分音符セルごとに投票します。ベースは8分音符以上、ピアノは8分音符以上または短い同時和音を弱いジョイント事前分布として加えます。アコギモデルの出力を主投票にし、MIDIはN-best順位の補助に限定します。
+アコギ抽出は必ずカスケード経路で実行します。まずSWの6 stemを保存し、Mega53で `acoustic-guitar.wav` と `guitar-other.wav` を生成します。アコギ専用のSolitito表示は四分音符単位で、統合コードのBTC推定とは独立しています。
 複数モデルの結果を足しても元音源に厳密に戻るとは限りません（混入音や音量の違いがあり得ます）。
 
 BS RoFormerはApple SiliconでMLX backendを優先します。MLXで動かない場合はTorch/MPS、それも使えない環境ではCPUに戻ります。

@@ -591,6 +591,9 @@ def _grid_first_estimate(acoustic: dict, grid: dict, piano_notes: list[dict],
 def estimate_chords(folder: str | Path, acoustic: dict | None = None,
                     drums: dict | None = None) -> dict:
     folder = Path(folder)
+    from analysis.btc_chords import audio_paths, estimate as estimate_btc
+    if audio_paths(folder):
+        return estimate_btc(folder, acoustic=acoustic)
     grid = _read_json(folder / "beat-grid.json")
     piano_notes = _read_json(folder / "piano-midi.json").get("notes", [])
     bass_notes = _read_json(folder / "bass-midi.json").get("notes", [])

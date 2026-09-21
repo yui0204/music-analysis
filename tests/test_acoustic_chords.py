@@ -233,7 +233,8 @@ class AcousticTests(unittest.TestCase):
                 window.close()
 
     def test_real_model_via_ui_and_cache(self):
-        if not (ROOT / ".cache/solitito/best_model_v2_take6_onset.onnx").exists():
+        from analysis.btc_chords import ROOT as BTC_ROOT, MODEL_FILE, MODEL
+        if not (BTC_ROOT / ".cache/btc" / MODEL_FILE).exists():
             self.skipTest("Download official model to run inference")
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -251,9 +252,10 @@ class AcousticTests(unittest.TestCase):
                 self.assertTrue((folder / CACHE_FILE).exists(), window.acoustic_chord_note.text())
                 data = json.loads((folder / CACHE_FILE).read_text())
                 self.assertEqual(data["chords"], window.acoustic_chord_view.chords)
-                self.assertEqual(data["_raw_chords"][-1]["end"], 2)
-                self.assertTrue(all(c["chord"] == "N.C." or c["end"] - c["start"] >= .5 - 1e-8
-                                    for c in data["chords"]))
+                self.assertEqual(data["chords"][-1]["end"], 2)
+                self.assertEqual(data["_model"], MODEL)
+                self.assertEqual(data["_audio_sources"], ["acoustic-guitar.wav"])
+                self.assertIn("BTC", window.acoustic_chord_note.text())
                 self.assertFalse((folder / "chords.json").exists())
             finally:
                 window.close()

@@ -2,8 +2,10 @@ import json
 import os
 import shutil
 import sys
+import threading
 import numpy as np
 import soundfile as sf
+import sounddevice as sd
 from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QPointF, QProcess, QRectF, Qt, QThread, QTimer, Signal, QUrl
@@ -12,7 +14,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QStyle, QStyleOptionSlider, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QStyle, QStyleOptionSlider, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QCheckBox,
 )
 from engine import EXTENSIONS, STEMS, SPECIALISTS, Separation
 from analysis.drum_midi import LANES, load_or_estimate
@@ -20,7 +22,8 @@ from analysis.piano_midi import load_or_estimate as load_or_estimate_piano
 from analysis.bass_midi import BASS_LOW, BASS_HIGH, load_or_estimate as load_or_estimate_bass
 from analysis.vocal_midi import VOCAL_LOW, VOCAL_HIGH, load_or_estimate as load_or_estimate_vocal
 from analysis.chord_estimator import load_or_estimate as load_or_estimate_chords
-from analysis.acoustic_chords import CACHE_FILE as ACOUSTIC_CHORD_CACHE, load_or_estimate as load_or_estimate_acoustic, prepare_chords
+from analysis.acoustic_chords import CACHE_FILE as ACOUSTIC_CHORD_CACHE, prepare_chords
+from analysis.btc_chords import load_acoustic as load_or_estimate_acoustic, MODEL as BTC_MODEL
 from analysis.beat_grid import load_or_estimate as load_or_estimate_beats, quantize_drum_events, quantize_note_events
 
 ROOT = Path(__file__).resolve().parent
@@ -347,7 +350,7 @@ def save_secondary_chord_shapes():
 
 def parse_chord_name(name):
     base = (name or "").replace("♭", "b").replace("♯", "#").strip()
-    if not base or base == "N.C.":
+    if not base or base in ("N.C.", "X"):
         return None, "", None
     slash = None
     if "/" in base:
@@ -776,7 +779,7 @@ class ChordTimelineView(QWidget):
         end = start + self.window_seconds
         self.card_rects = []
         painter.setPen(QPen(QColor("#aeb4c4")))
-        hint = "クリック/ドラッグした四分音符を修正" if self.editable else "Solitito · アコギ"
+        hint = "クリック/ドラッグした四分音符を修正" if self.editable else "アコギコード"
         painter.drawText(lane.adjusted(8, 6, -8, -6), Qt.AlignLeft | Qt.AlignTop, f"Chords {len(self.chords)}  ·  {hint}")
         if not self.chords:
             painter.setPen(QPen(QColor("#7d8291")))
@@ -900,7 +903,7 @@ class ChordTimelineView(QWidget):
         shape = local_shape or chord_shape(name)
         if not shape or all(f < 0 for f in shape.get("frets", [])):
             painter.setPen(QPen(QColor("#8f93a3")))
-            painter.drawText(card.adjusted(8, 48, -8, -8), Qt.AlignCenter, "フォーム未登録" if name != "N.C." else name)
+            painter.drawText(card.adjusted(8, 48, -8, -8), Qt.AlignCenter, "判定不能" if name == "X" else ("フォーム未登録" if name != "N.C." else name))
             return
         grid = QRectF(card.left() + 10, card.top() + 46, min(86, card.width() - 18), card.height() - 56)
         self.draw_diagram(painter, grid, shape)
@@ -1293,9 +1296,12 @@ class ChordAnalysisWorker(QThread):
 
     def run(self):
         try:
-            self.status.emit("アコギのコードを推定中…")
-            acoustic = load_or_estimate_acoustic(self.folder, force=True)
-            self.status.emit("アコギを基準にコードを再推定中…")
+            acoustic_path = self.folder / "acoustic-guitar-chords.json"
+            acoustic = json.loads(acoustic_path.read_text(encoding="utf-8")) if acoustic_path.is_file() else {}
+            if (self.folder / "acoustic-guitar.wav").is_file():
+                self.status.emit("BTCでアコギのコードを推定中…")
+                acoustic = load_or_estimate_acoustic(self.folder, force=True)
+            self.status.emit("BTC大語彙モデルでコードを推定中…")
             drums_path = self.folder / "drums-midi.json"
             drums = json.loads(drums_path.read_text(encoding="utf-8")) if drums_path.is_file() else {}
             chords = load_or_estimate_chords(self.folder, force=True, acoustic=acoustic, drums=drums)
@@ -1385,6 +1391,18 @@ class Window(QMainWindow):
         self.full_analysis_worker = None
         self.play_buttons = {}
         self.seek_controls = {}
+        self.mix_checks = {}
+        self.mix_players = []
+        self.mix_master_path = None
+        self.mix_output_path = None
+        self.mix_cache = {}
+        self.mix_sample_rate = None
+        self.mix_duration_frames = 0
+        self.mix_selected_paths = set()
+        self.mix_frame = 0
+        self.mix_stream = None
+        self.mix_realtime_playing = False
+        self.mix_lock = threading.RLock()
         self.pending_seek = None
         self.smooth_position = 0
         self.smooth_anchor = 0
@@ -1502,6 +1520,18 @@ class Window(QMainWindow):
         output_actions.addWidget(self.open_output, 1)
         output_actions.addWidget(self.export_video, 1)
         layout.addLayout(output_actions)
+
+        transport = QHBoxLayout()
+        self.mix_play = QPushButton("▶ 選択したパートを再生")
+        self.mix_play.setEnabled(False)
+        self.mix_play.clicked.connect(self.toggle_mix_playback)
+        transport.addWidget(self.mix_play)
+        self.mix_stop = QPushButton("■ 停止")
+        self.mix_stop.setEnabled(False)
+        self.mix_stop.clicked.connect(self.stop_mix_playback)
+        transport.addWidget(self.mix_stop)
+        transport.addWidget(QLabel("チェックした分離音を同じ再生位置でミックスします。"), 1)
+        layout.addLayout(transport)
 
         self.results = QVBoxLayout()
         layout.addLayout(self.results)
@@ -1797,7 +1827,20 @@ class Window(QMainWindow):
         self.stop_full_analysis_worker()
         self.play_buttons.clear()
         self.seek_controls.clear()
+        self.mix_checks.clear()
+        self.stop_mix_playback()
+        if self.mix_stream:
+            self.mix_stream.close()
+            self.mix_stream = None
+        with self.mix_lock:
+            self.mix_cache.clear()
+            self.mix_sample_rate = None
+            self.mix_duration_frames = 0
+            self.mix_selected_paths = set()
+            self.mix_frame = 0
         self.pending_seek = None
+        self.mix_play.setEnabled(False)
+        self.mix_stop.setEnabled(False)
         self.smooth_position = 0
         self.smooth_anchor = 0
         while self.results.count():
@@ -1827,7 +1870,7 @@ class Window(QMainWindow):
             for stem in stems:
                 if stem not in known_order:
                     known_order.append(stem)
-        existing = {path.stem for path in Path(folder).glob("*.wav") if path.is_file()}
+        existing = {path.stem for path in Path(folder).glob("*.wav") if path.is_file() and not path.name.startswith(".")}
         ordered = [stem for stem in known_order if stem in existing]
         ordered.extend(sorted(existing - set(ordered)))
         return ordered
@@ -1933,10 +1976,13 @@ class Window(QMainWindow):
                 box.addWidget(toggle)
             else:
                 toggle = None
-            play = QPushButton("▶ 試聴")
-            play.clicked.connect(lambda checked=False, p=path: self.play(p))
-            self.play_buttons[str(path)] = play
-            box.addWidget(play)
+            mix_check = QCheckBox("再生")
+            mix_check.setChecked(False)
+            mix_check.setToolTip("チェックしたパートを同期して再生します")
+            mix_check.toggled.connect(self.on_mix_selection_changed)
+            self.mix_checks[str(path)] = mix_check
+            box.addWidget(mix_check)
+            self.mix_play.setEnabled(True)
             timeline = QHBoxLayout()
             slider = SeekSlider(Qt.Horizontal)
             try:
@@ -1970,6 +2016,7 @@ class Window(QMainWindow):
             elif stem == "acoustic-guitar" and path.is_file():
                 self.add_acoustic_chord_panel(row_layout, toggle, default_visible=True)
             self.results.addWidget(row)
+        self.preload_mix_stems(list(self.mix_checks))
         self.update_chord_label()
 
     def edit_chord(self, index, current, range_start=None, range_end=None, acoustic=False):
@@ -2154,7 +2201,7 @@ class Window(QMainWindow):
         self.acoustic_chord_view.chordEdited.connect(self.edit_acoustic_chord)
         layout.addWidget(self.acoustic_chord_view)
         controls = QHBoxLayout()
-        self.acoustic_chord_note = QLabel("Solititoでアコギのコードを推定できます。")
+        self.acoustic_chord_note = QLabel("BTCでアコギのコードを推定できます。")
         self.acoustic_chord_note.setObjectName("muted")
         self.acoustic_chord_note.setWordWrap(True)
         controls.addWidget(self.acoustic_chord_note, 1)
@@ -2174,25 +2221,26 @@ class Window(QMainWindow):
         # The normal inference result needs repair/quantisation. Once a user
         # has edited a beat cell, its exact boundaries must survive refreshes
         # and application restarts, so do not run that repair again.
-        if not data.get("_manual_edits"):
+        if not data.get("_manual_edits") and data.get("_model") != BTC_MODEL:
             data = prepare_chords(data, self.beat_grid)
         self.acoustic_chords = data
         for view in self.acoustic_chord_views:
             view.set_chords(data)
             view.set_position_ms(self.smooth_position)
-        self.acoustic_chord_note.setText(f"Solitito · {len(data.get('chords', []))} コード区間（参考） · 短い区間を補完・4分音符に整列")
+        model_name = "BTC大語彙" if data.get("_model") == BTC_MODEL else "Solitito（旧結果）"
+        self.acoustic_chord_note.setText(f"{model_name} · {len(data.get('chords', []))} コード区間（参考）")
 
     def load_acoustic_chords(self, checked=False):
         if (not self.result_folder or self.acoustic_process is not None or
                 (self.full_analysis_worker and self.full_analysis_worker.isRunning())):
             return
-        self.acoustic_chord_note.setText("Solititoで再コード解析中…（毎回再実行）")
+        self.acoustic_chord_note.setText("BTCで再コード解析中…（毎回再実行）")
         process = QProcess(self)
         self.acoustic_process = process
         process.setWorkingDirectory(str(ROOT))
         process.finished.connect(lambda code, status, p=process: self.on_acoustic_finished(p, code))
         process.errorOccurred.connect(lambda error, p=process: self.on_acoustic_process_error(p, error))
-        process.start(sys.executable, [str(ROOT / "analysis" / "acoustic_chords.py"), str(self.result_folder.resolve()), "--force"])
+        process.start(sys.executable, ["-m", "analysis.btc_chords", str(self.result_folder.resolve()), "--force"])
 
     def on_acoustic_process_error(self, process, error):
         if process is self.acoustic_process:
@@ -2346,41 +2394,171 @@ class Window(QMainWindow):
         panel.setVisible(visible)
         button.setText("コードビューを隠す" if visible else "コードビューを表示")
 
+    def selected_mix_paths(self):
+        return [path for path, checkbox in self.mix_checks.items()
+                if checkbox.isChecked() and Path(path).is_file()]
+
+    def _load_mix_stem(self, path):
+        """Decode one stem once; toggling uses this cache and never reopens it."""
+        with self.mix_lock:
+            if path in self.mix_cache:
+                return
+        samples, rate = sf.read(path, dtype="float32", always_2d=True)
+        if self.mix_sample_rate is None:
+            self.mix_sample_rate = rate
+        if rate != self.mix_sample_rate:
+            frame_count = max(1, round(len(samples) * self.mix_sample_rate / rate))
+            source = np.linspace(0.0, 1.0, len(samples), endpoint=False)
+            target = np.linspace(0.0, 1.0, frame_count, endpoint=False)
+            samples = np.column_stack([np.interp(target, source, samples[:, channel])
+                                       for channel in range(samples.shape[1])]).astype(np.float32)
+        if samples.shape[1] == 1:
+            samples = np.repeat(samples, 2, axis=1)
+        elif samples.shape[1] > 2:
+            samples = samples[:, :2]
+        with self.mix_lock:
+            self.mix_cache[path] = samples
+            self.mix_duration_frames = max(self.mix_duration_frames, len(samples))
+
+    def preload_mix_stems(self, paths):
+        """Decode visible stems off the UI thread for instantaneous toggles."""
+        def preload():
+            for path in paths:
+                try:
+                    self._load_mix_stem(path)
+                except (OSError, sf.LibsndfileError):
+                    continue
+        threading.Thread(target=preload, daemon=True, name="mix-stem-preload").start()
+
+    def _mix_audio_callback(self, outdata, frames, _time, _status):
+        outdata.fill(0)
+        with self.mix_lock:
+            start = self.mix_frame
+            selected = tuple(self.mix_selected_paths)
+            for path in selected:
+                samples = self.mix_cache.get(path)
+                if samples is None or start >= len(samples):
+                    continue
+                amount = min(frames, len(samples) - start)
+                outdata[:amount] += samples[start:start + amount]
+            self.mix_frame += frames
+            if self.mix_frame >= self.mix_duration_frames:
+                self.mix_realtime_playing = False
+        np.clip(outdata, -1.0, 1.0, out=outdata)
+
+    def _set_mix_transport_ui(self, playing):
+        self.mix_play.setText("Ⅱ 一時停止" if playing else "▶ 選択したパートを再生")
+        self.mix_stop.setEnabled(playing)
+        if playing and not self.playback_timer.isActive():
+            self.playback_timer.start()
+        elif not playing:
+            self.playback_timer.stop()
+
+    def dispose_mix_players(self):
+        for player, output in self.mix_players:
+            player.stop()
+            player.setSource(QUrl())
+            player.setAudioOutput(None)
+            player.deleteLater()
+            output.deleteLater()
+        self.mix_players = []
+        self.mix_master_path = None
+
+    def on_mix_selection_changed(self, _checked=None):
+        paths = self.selected_mix_paths()
+        for path in paths:
+            try:
+                self._load_mix_stem(path)
+            except (OSError, sf.LibsndfileError):
+                self.status.setText(f"再生できません: {Path(path).name}")
+                return
+        if self.mix_realtime_playing:
+            with self.mix_lock:
+                self.mix_selected_paths = set(paths)
+            self.status.setText("同期再生中: " + " / ".join(
+                NAMES.get(Path(path).stem, Path(path).stem) for path in paths))
+            return
+        self.status.setText(f"再生パートを {len(paths)} 個選択中。再生ボタンで反映します。")
+
     def change_playback_rate(self):
-        rate = self.speed_combo.currentData()
-        self.player.setPlaybackRate(float(rate or 1.0))
+        rate = float(self.speed_combo.currentData() or 1.0)
+        self.player.setPlaybackRate(rate)
+        for player, _ in self.mix_players:
+            player.setPlaybackRate(rate)
         self.smooth_anchor = self.player.position()
         self.smooth_clock.restart()
 
-    def play(self, path):
-        url = QUrl.fromLocalFile(str(path))
-        if self.player.source() == url and self.player.playbackState() == QMediaPlayer.PlayingState:
-            self.player.pause()
-        else:
-            if self.player.source() != url:
-                slider, _ = self.seek_controls[str(path)]
-                self.pending_seek = (str(path), slider.value())
-                self.player.setSource(url)
-            elif self.player.mediaStatus() == QMediaPlayer.EndOfMedia:
-                self.player.setPosition(0)
-            self.player.play()
-        self.sync_play_buttons(self.player.playbackState())
+    def toggle_mix_playback(self):
+        if self.mix_realtime_playing:
+            with self.mix_lock:
+                self.mix_realtime_playing = False
+            if self.mix_stream:
+                self.mix_stream.stop()
+            self._set_mix_transport_ui(False)
+            return
+        self.start_mix_playback(self.smooth_position)
+
+    def start_mix_playback(self, position=None):
+        paths = self.selected_mix_paths()
+        if not paths:
+            self.status.setText("再生するパートを1つ以上チェックしてください。")
+            return
+        try:
+            for path in paths:
+                self._load_mix_stem(path)
+            if self.mix_sample_rate is None:
+                raise RuntimeError("音声を読み込めませんでした。")
+            if self.mix_stream is None:
+                self.mix_stream = sd.OutputStream(
+                    samplerate=self.mix_sample_rate, channels=2, dtype="float32",
+                    callback=self._mix_audio_callback)
+            position = max(0, int(self.smooth_position if position is None else position))
+            with self.mix_lock:
+                self.mix_selected_paths = set(paths)
+                self.mix_frame = min(self.mix_duration_frames,
+                                     round(position * self.mix_sample_rate / 1000))
+                self.mix_realtime_playing = True
+            if not self.mix_stream.active:
+                self.mix_stream.start()
+            self.smooth_anchor = position
+            self.smooth_clock.restart()
+            self._set_mix_transport_ui(True)
+            self.status.setText("同期再生中: " + " / ".join(
+                NAMES.get(Path(path).stem, Path(path).stem) for path in paths))
+        except Exception as exc:
+            self.status.setText("同期再生を開始できません: " + str(exc))
+
+    def stop_mix_playback(self):
+        with self.mix_lock:
+            self.mix_realtime_playing = False
+            self.mix_frame = 0
+            self.mix_selected_paths = set()
+        if self.mix_stream and self.mix_stream.active:
+            self.mix_stream.stop()
+        self.player.stop()
+        self.dispose_mix_players()
+        self._set_mix_transport_ui(False)
+
+    def set_mix_position(self, position):
+        position = max(0, int(position))
+        self.smooth_position = position
+        self.smooth_anchor = position
+        with self.mix_lock:
+            if self.mix_sample_rate:
+                self.mix_frame = min(self.mix_duration_frames,
+                                     round(position * self.mix_sample_rate / 1000))
+        self.player.setPosition(position)
+        self.render_playback_position(position)
 
     def seek(self, path, position):
         slider, clock = self.seek_controls[str(path)]
         clock.setText(f"{timestamp(position)} / {timestamp(slider.maximum())}")
-        if self.player.source().toLocalFile() == str(path):
-            if self.pending_seek:
-                self.pending_seek = (str(path), position)
-            else:
-                self.player.setPosition(position)
+        self.set_mix_position(position)
 
     def media_ready(self, status):
-        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia) and self.pending_seek:
-            path, position = self.pending_seek
-            if self.player.source().toLocalFile() == path:
-                self.pending_seek = None
-                self.player.setPosition(position)
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia) and self.pending_seek is not None:
+            self.set_mix_position(self.pending_seek)
+            self.pending_seek = None
 
     def update_play_position(self, position):
         self.smooth_position = max(0, int(position))
@@ -2402,17 +2580,25 @@ class Window(QMainWindow):
         if self.acoustic_chord_view:
             for view in self.acoustic_chord_views:
                 view.set_position_ms(position)
-        controls = self.seek_controls.get(self.player.source().toLocalFile())
-        if not controls or self.pending_seek:
-            return
-        slider, clock = controls
-        if not slider.isSliderDown():
-            slider.blockSignals(True)
-            slider.setValue(position)
-            slider.blockSignals(False)
+        for slider, clock in self.seek_controls.values():
+            if not slider.isSliderDown():
+                slider.blockSignals(True)
+                slider.setValue(min(position, slider.maximum()))
+                slider.blockSignals(False)
             clock.setText(f"{timestamp(position)} / {timestamp(slider.maximum())}")
 
     def refresh_playback_position(self):
+        if self.mix_realtime_playing:
+            with self.mix_lock:
+                position = round(self.mix_frame * 1000 / self.mix_sample_rate) if self.mix_sample_rate else 0
+                finished = self.mix_frame >= self.mix_duration_frames
+            self.smooth_position = position
+            self.render_playback_position(position)
+            if finished:
+                if self.mix_stream and self.mix_stream.active:
+                    self.mix_stream.stop()
+                self._set_mix_transport_ui(False)
+            return
         if self.player.playbackState() == QMediaPlayer.PlayingState and self.smooth_clock.isValid():
             position = self.smooth_anchor + self.smooth_clock.elapsed() * self.player.playbackRate()
             duration = self.player.duration()
@@ -2423,7 +2609,8 @@ class Window(QMainWindow):
             self.update_play_position(self.player.position())
 
     def sync_play_buttons(self, state):
-        if state == QMediaPlayer.PlayingState:
+        playing = state == QMediaPlayer.PlayingState
+        if playing:
             self.smooth_anchor = self.player.position()
             self.smooth_clock.restart()
             if not self.playback_timer.isActive():
@@ -2431,9 +2618,9 @@ class Window(QMainWindow):
         else:
             self.playback_timer.stop()
             self.refresh_playback_position()
-        for path, button in self.play_buttons.items():
-            active = state == QMediaPlayer.PlayingState and self.player.source().toLocalFile() == path
-            button.setText("Ⅱ 一時停止" if active else "▶ 試聴")
+        if hasattr(self, "mix_play"):
+            self.mix_play.setText("Ⅱ 一時停止" if playing else "▶ 選択したパートを再生")
+            self.mix_stop.setEnabled(playing)
 
     def on_error(self, message):
         self.progress.setRange(0, 100)
